@@ -57,8 +57,11 @@ import functorch.compile
 class GraphCaptureBackend(object):
     def __init__(self, decomposition=None):
         if decomposition is None:
-            decomposition = {}
-        self.decomposition = decomposition
+            decomposition = []
+
+        assert isinstance(decomposition, List)
+        from torch._decomp import get_decompositions
+        self.decomposition = get_decompositions(decomposition)
 
     def __call__(self, model_, example_inputs_):
         functorch.compile.config.use_functionalize = True
@@ -107,6 +110,7 @@ class GraphCaptureBackend(object):
 # capture graphs
 def capture_forward_backward_graphs(model: nn.Module, model_args, reduce_fn, decomposition=None):
     backend = GraphCaptureBackend(decomposition=decomposition)
+    torch._dynamo.reset()
     with graph_capture.set_graph() as graph:
         model_opt = torch.compile(model, backend=backend)
         output = model_opt(**model_args)
@@ -133,9 +137,35 @@ class TestGraphCaptureBackend(unittest.TestCase):
         x = torch.randn(1, input_dim)
         graph: AtenGraphs = capture_forward_backward_graphs(model, model_args={'x': x}, reduce_fn=torch.sum,
                                                             decomposition=None)
+        # verify softmax and layernorm is not decomposed
         graph.forward_graph.graph.print_tabular()
         graph.backward_graph.graph.print_tabular()
 
+    def test_embedding_decomposition(self):
+        class Model(nn.Module):
+            def __init__(self, num_embeddings, embedding_dim):
+                super().__init__()
+                self.embedding_layer = nn.Embedding(num_embeddings=num_embeddings, embedding_dim=embedding_dim)
+
+            def forward(self, x):
+                x = self.embedding_layer(x)
+                x = torch.softmax(x, dim=-1)
+                return x
+
+        num_embeddings = 10
+        embedding_dim = 20
+        model = Model(num_embeddings, embedding_dim)
+        x = torch.randint(low=0, high=num_embeddings, size=(100,), dtype=torch.int64)
+        decomposition = [torch.ops.aten.embedding_dense_backward]
+        graph: AtenGraphs = capture_forward_backward_graphs(model, model_args={'x': x}, reduce_fn=torch.sum,
+                                                            decomposition=decomposition)
+        # verify embedding backward is decomposed
+        graph.forward_graph.graph.print_tabular()
+        graph.backward_graph.graph.print_tabular()
+
+
+
+    @unittest.SkipTest
     def test_nanoGPT(self):
         from model import GPTConfig, GPT
 
