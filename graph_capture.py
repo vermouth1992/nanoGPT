@@ -78,27 +78,13 @@ class GraphCaptureBackend(object):
                 graph_capture.graph.forward_input = example_inputs
             return gm
 
-        def fw_compiler(model: torch.fx.GraphModule, example_inputs):
-            return inner_compile(
-                model,
-                example_inputs,
-                is_backward=False
-            )
-
-        def bw_compiler(model: torch.fx.GraphModule, example_inputs):
-            return inner_compile(
-                model,
-                example_inputs,
-                is_backward=True,
-            )
-
         with compile_fx.overrides.patch_functions():
             # TODO: can add logging before/after the call to create_aot_dispatcher_function
             # in torch._functorch/aot_autograd.py::aot_module_simplified::aot_function_simplified::new_func
             # once torchdynamo is merged into pytorch
             return compile_fx.aot_autograd(
-                fw_compiler=fw_compiler,
-                bw_compiler=bw_compiler,
+                fw_compiler=functools.partial(inner_compile, is_backward=False),
+                bw_compiler=functools.partial(inner_compile, is_backward=True),
                 decompositions=self.decomposition,
                 partition_fn=functools.partial(
                     compile_fx.min_cut_rematerialization_partition, compiler="inductor"
@@ -162,8 +148,6 @@ class TestGraphCaptureBackend(unittest.TestCase):
         # verify embedding backward is decomposed
         graph.forward_graph.graph.print_tabular()
         graph.backward_graph.graph.print_tabular()
-
-
 
     @unittest.SkipTest
     def test_nanoGPT(self):
