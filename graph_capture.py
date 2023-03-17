@@ -149,6 +149,19 @@ class TestGraphCaptureBackend(unittest.TestCase):
         graph.forward_graph.graph.print_tabular()
         graph.backward_graph.graph.print_tabular()
 
+    def test_arange(self):
+        def func(x):
+            idx = torch.arange(0, x.shape[0], dtype=torch.int64)
+            return x + idx.to(x.dtype)
+
+        x = torch.randn(size=(100,), requires_grad=True)
+        graph: AtenGraphs = capture_forward_backward_graphs(func, model_args={'x': x}, reduce_fn=torch.sum,
+                                                            decomposition=None)
+        # verify arange is kept the same
+        graph.forward_graph.graph.print_tabular()
+        graph.backward_graph.graph.print_tabular()
+
+
     @unittest.SkipTest
     def test_nanoGPT(self):
         from model import GPTConfig, GPT
