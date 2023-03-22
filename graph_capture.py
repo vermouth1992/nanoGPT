@@ -56,23 +56,28 @@ import functorch.compile
 
 
 class GraphCaptureBackend(object):
-    def __init__(self, decomposition=None):
+    def __init__(self, decomposition=None, partition_fn=None):
         if decomposition is None:
             decomposition = []
+
+        if partition_fn == 'default' or partition_fn is None:
+            partition_fn = functorch.compile.default_partition
+        elif partition_fn == 'inductor':
+            partition_fn = functools.partial(
+                compile_fx.min_cut_rematerialization_partition, compiler="inductor"
+            )
+        else:
+            raise ValueError('Unknown partition_fn')
 
         assert isinstance(decomposition, List)
         from torch._decomp import get_decompositions
         self.decomposition = get_decompositions(decomposition)
+        self.partition_fn = partition_fn
 
-    def __call__(self, model_: torch.fx.GraphModule, example_inputs_, partition_fn=functorch.compile.default_partition):
+    def __call__(self, model_: torch.fx.GraphModule, example_inputs_):
         functorch.compile.config.use_functionalize = True
         functorch.compile.config.use_fake_tensor = True
         torch._inductor.config.fallback_random = True
-
-        # uncomment the following line to switch to inductor partition_fn
-        # partition_fn = functools.partial(
-        #     compile_fx.min_cut_rematerialization_partition, compiler="inductor"
-        # )
 
         from torch._inductor.overrides import replacements
         replacements[torch.nn.functional.dropout] = lambda input, p, training, inplace: \
@@ -97,7 +102,7 @@ class GraphCaptureBackend(object):
                 fw_compiler=functools.partial(inner_compile, is_backward=False),
                 bw_compiler=functools.partial(inner_compile, is_backward=True),
                 decompositions=self.decomposition,
-                partition_fn=partition_fn,
+                partition_fn=self.partition_fn,
                 keep_inference_input_mutations=True,
             )(model_, example_inputs_)
 
