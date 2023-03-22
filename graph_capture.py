@@ -50,6 +50,7 @@ graph_capture = GraphCaptureContext()
 
 import torch._dynamo.symbolic_convert
 import torch._inductor.compile_fx as compile_fx
+import torch._inductor.config
 
 import functorch.compile
 
@@ -63,9 +64,19 @@ class GraphCaptureBackend(object):
         from torch._decomp import get_decompositions
         self.decomposition = get_decompositions(decomposition)
 
-    def __call__(self, model_, example_inputs_):
+    def __call__(self, model_: torch.fx.GraphModule, example_inputs_, partition_fn=functorch.compile.default_partition):
         functorch.compile.config.use_functionalize = True
         functorch.compile.config.use_fake_tensor = True
+        torch._inductor.config.fallback_random = True
+
+        # uncomment the following line to switch to inductor partition_fn
+        # partition_fn = functools.partial(
+        #     compile_fx.min_cut_rematerialization_partition, compiler="inductor"
+        # )
+
+        from torch._inductor.overrides import replacements
+        replacements[torch.nn.functional.dropout] = lambda input, p, training, inplace: \
+            torch.ops.aten.native_dropout(input, p=p, train=training)[0]
 
         def inner_compile(gm: torch.fx.GraphModule,
                           example_inputs: List[torch.Tensor],
@@ -86,20 +97,23 @@ class GraphCaptureBackend(object):
                 fw_compiler=functools.partial(inner_compile, is_backward=False),
                 bw_compiler=functools.partial(inner_compile, is_backward=True),
                 decompositions=self.decomposition,
-                partition_fn=functools.partial(
-                    compile_fx.min_cut_rematerialization_partition, compiler="inductor"
-                ),
+                partition_fn=partition_fn,
                 keep_inference_input_mutations=True,
             )(model_, example_inputs_)
 
 
 # capture graphs
-def capture_forward_backward_graphs(model: nn.Module, model_args, reduce_fn, decomposition=None):
+def capture_forward_backward_graphs(model: nn.Module, model_args=None, model_kwargs=None, reduce_fn=torch.sum,
+                                    decomposition=None):
+    if model_args is None:
+        model_args = tuple()
+    if model_kwargs is None:
+        model_kwargs = dict()
     backend = GraphCaptureBackend(decomposition=decomposition)
     torch._dynamo.reset()
     with graph_capture.set_graph() as graph:
         model_opt = torch.compile(model, backend=backend)
-        output = model_opt(**model_args)
+        output = model_opt(*model_args, **model_kwargs)
         loss = reduce_fn(output)
         loss.backward()
 
@@ -121,9 +135,29 @@ class TestGraphCaptureBackend(unittest.TestCase):
         input_dim = 10
         model = Model(input_dim)
         x = torch.randn(1, input_dim)
-        graph: AtenGraphs = capture_forward_backward_graphs(model, model_args={'x': x}, reduce_fn=torch.sum,
+        graph: AtenGraphs = capture_forward_backward_graphs(model, model_kwargs={'x': x}, reduce_fn=torch.sum,
                                                             decomposition=None)
         # verify softmax and layernorm is not decomposed
+        graph.forward_graph.graph.print_tabular()
+        graph.backward_graph.graph.print_tabular()
+
+    def test_dropout(self):
+        class Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(10, 20)
+
+            def forward(self, x):
+                x = self.linear(x)
+                x = torch.nn.functional.relu(x)
+                x = torch.nn.functional.dropout(x, p=0.5, training=self.training)
+                return x
+
+        model = Model()
+        x = torch.randn(10, 10)
+        graph: AtenGraphs = capture_forward_backward_graphs(model, model_args=(x,), reduce_fn=torch.sum,
+                                                            decomposition=None)
+        # verify embedding backward is decomposed
         graph.forward_graph.graph.print_tabular()
         graph.backward_graph.graph.print_tabular()
 
@@ -143,7 +177,7 @@ class TestGraphCaptureBackend(unittest.TestCase):
         model = Model(num_embeddings, embedding_dim)
         x = torch.randint(low=0, high=num_embeddings, size=(100,), dtype=torch.int64)
         decomposition = [torch.ops.aten.embedding_dense_backward]
-        graph: AtenGraphs = capture_forward_backward_graphs(model, model_args={'x': x}, reduce_fn=torch.sum,
+        graph: AtenGraphs = capture_forward_backward_graphs(model, model_kwargs={'x': x}, reduce_fn=torch.sum,
                                                             decomposition=decomposition)
         # verify embedding backward is decomposed
         graph.forward_graph.graph.print_tabular()
@@ -155,12 +189,11 @@ class TestGraphCaptureBackend(unittest.TestCase):
             return x + idx.to(x.dtype)
 
         x = torch.randn(size=(100,), requires_grad=True)
-        graph: AtenGraphs = capture_forward_backward_graphs(func, model_args={'x': x}, reduce_fn=torch.sum,
+        graph: AtenGraphs = capture_forward_backward_graphs(func, model_kwargs={'x': x}, reduce_fn=torch.sum,
                                                             decomposition=None)
         # verify arange is kept the same
         graph.forward_graph.graph.print_tabular()
         graph.backward_graph.graph.print_tabular()
-
 
     @unittest.SkipTest
     def test_nanoGPT(self):
@@ -199,7 +232,7 @@ class TestGraphCaptureBackend(unittest.TestCase):
         input = torch.randint(low=0, high=model_args['vocab_size'], size=(1, 1), device='cpu',
                               dtype=torch.int64)
 
-        graph: AtenGraphs = capture_forward_backward_graphs(model, model_args={'idx': input}, reduce_fn=torch.sum,
+        graph: AtenGraphs = capture_forward_backward_graphs(model, model_kwargs={'idx': input}, reduce_fn=torch.sum,
                                                             decomposition=None)
 
         # do something with the graph
